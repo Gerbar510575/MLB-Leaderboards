@@ -8,8 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync                                              # install dependencies
-uvicorn backend.main:app --reload --port 8000        # start dev server
-python main.py                                       # alternative startup
+uv run uvicorn backend.main:app --reload --port 8000 # start dev server
+uv run python main.py                                # alternative startup
 ```
 
 ### Frontend
@@ -33,13 +33,17 @@ curl -si "http://localhost:8000/api/v1/leaderboard?metric_name=exit_velocity&lim
 curl "http://localhost:8000/api/v1/cache/stats"
 curl -X DELETE "http://localhost:8000/api/v1/cache"
 
-# Real data refresh (requires network; runs in background ~10-20 s)
+# Real data refresh (requires network; runs in background ~30-45 s with all 6 sources)
 curl -X POST "http://localhost:8000/api/v1/data/refresh?year=2026"
-curl "http://localhost:8000/api/v1/data/status"
+curl "http://localhost:8000/api/v1/data/status"   # includes scheduler.next_run
 
 # Fantasy roster sync (requires Yahoo OAuth credentials in .env)
-curl -X POST "http://localhost:8000/api/v1/fantasy/sync"
+curl -X POST "http://localhost:8000/api/v1/fantasy/sync"   # returns events count
 curl "http://localhost:8000/api/v1/fantasy/status"
+
+# SQLite history (inspect directly)
+sqlite3 backend/data/mlb_history.db "SELECT COUNT(*) FROM stat_snapshots;"
+sqlite3 backend/data/mlb_history.db "SELECT * FROM fantasy_events ORDER BY event_at DESC LIMIT 10;"
 ```
 
 ## Architecture
@@ -96,6 +100,12 @@ _ASCENDING_METRICS: set[str] = {"p_xera", "p_xwoba_against", "p_hard_hit_rate", 
 
 **`normalize_name()`** — verbatim copy of `yahoo-fantasy-agent/player_list.py::normalize_name`. Used exclusively for the Fantasy ownership JOIN (match Statcast player names to Yahoo roster names). Both Statcast data sources share `player_id` (MLBAM ID) so no name matching is needed for data joining. Must stay in sync with the original.
 
+**SQLite history database (`backend/data/mlb_history.db`)** — append-only history store. Two tables:
+- `stat_snapshots`: every metric record from every refresh. Written by `_write_stat_snapshot(aggregates, snapshot_at)` after each successful `_run_refresh()`. Indexed on `(player_id, metric_name, snapshot_at)`.
+- `fantasy_events`: ownership change events only (pickup / drop / trade). Written by `_write_fantasy_events(events)` when `_detect_fantasy_events()` finds diffs between old and new `_fantasy_index`. First-ever sync is skipped (no old index to compare). Indexed on `(match_key, event_at)`.
+
+`_init_db()` runs at startup via `lifespan` using `CREATE TABLE IF NOT EXISTS` — safe to call repeatedly. All DB writes are non-fatal: wrapped in `try/except`, log `warning` on failure, never interrupt the main refresh/sync flow. `DB_PATH = backend/data/mlb_history.db` (gitignored; `backend/data/.gitkeep` ensures the directory is tracked).
+
 ### Frontend (`frontend/src/components/Leaderboard.jsx`)
 
 Single component. Key things to know:
@@ -126,6 +136,7 @@ POST /api/v1/data/refresh
       → join batters by player_id; join pitchers by player_id / mlbID (all MLBAM ID)
     → os.replace(real_data.json.tmp → real_data.json)        ← atomic write
     → _cache.clear()
+    → _write_stat_snapshot(aggregates, fetched_at)           ← SQLite append (non-fatal)
 
 GET /api/v1/leaderboard
   → load_data()                                  ← real_data.json (or {} / [] if absent → 404)

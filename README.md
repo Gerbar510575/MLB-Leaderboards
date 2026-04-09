@@ -4,7 +4,8 @@
 
 ## 功能特色
 
-- **即時 Statcast 數據**：一鍵從 Baseball Savant 取得當季真實數據
+- **即時 Statcast 數據**：一鍵從 Baseball Savant 取得當季真實數據，自動排程每日更新
+- **歷史資料庫**：每次 refresh 自動寫入 SQLite，完整保存整季指標趨勢；Fantasy 持有異動（pickup / drop / trade）以 event 型態記錄
 - **打者指標排行榜**：Exit Velocity、xBA、xSLG、xwOBA、xwOBA-diff、Hard Hit Rate、Barrel Rate、Launch Angle、Sprint Speed（共 9 項）
 - **投手指標排行榜**：xERA、ERA−xERA、xwOBA Against、Hard Hit% Against、Barrel% Against、Avg EV Against、K/9、BB/9、K-BB%（共 9 項，低分優先指標自動反轉排序）
 - **最低樣本數篩選**：模擬 Savant 的「最低 BBE / PA / 跑壘機會」門檻，排除樣本不足的球員
@@ -22,8 +23,10 @@ MLB_Leaderboards/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI 應用程式（全部邏輯）
 │   └── data/
+│       ├── .gitkeep             # 確保目錄被 Git 追蹤
 │       ├── real_data.json        # pybaseball 抓取後產生（gitignore）
-│       └── fantasy_roster.json  # Fantasy 名單快取（gitignore）
+│       ├── fantasy_roster.json  # Fantasy 名單快取（gitignore）
+│       └── mlb_history.db       # SQLite 歷史資料庫（gitignore）
 ├── frontend/
 │   ├── package.json
 │   ├── vite.config.js       # /api proxy → localhost:8000
@@ -43,14 +46,14 @@ MLB_Leaderboards/
 
 ### 前置需求
 
-- Python ≥ 3.11（建議搭配 [uv](https://github.com/astral-sh/uv)）
+- Python ≥ 3.11（使用 [uv](https://github.com/astral-sh/uv) 管理依賴）
 - Node.js ≥ 18
 - Yahoo Fantasy 聯盟（若要使用 Fantasy 同步功能）
 
 ### 後端
 
 ```bash
-# 安裝依賴
+# 安裝依賴（含 apscheduler）
 uv sync
 
 # 設定環境變數（Fantasy 同步需要）
@@ -60,8 +63,8 @@ uv sync
 # 2. 首次執行 yahoo-fantasy-agent 登入以產生 oauth2.json
 # 3. Fantasy 名單同步後排程每小時自動更新
 
-# 啟動（APScheduler 隨服務自動啟動）
-uvicorn backend.main:app --reload --port 8000
+# 啟動（APScheduler 與 SQLite 初始化隨服務自動完成）
+uv run uvicorn backend.main:app --reload --port 8000
 
 # 排程行為（無需額外設定）：
 #   Fantasy 名單同步：每 1 小時自動執行
@@ -114,11 +117,23 @@ npm run dev
     "status": "done",
     "started_at": "2026-04-08T14:29:45Z",
     "error": null
+  },
+  "scheduler": {
+    "stats_refresh": { "next_run": "2026-04-09T14:00:00+0000", "schedule": "Daily ET 10:00, Mar–Oct" },
+    "fantasy_sync":  { "next_run": "2026-04-08T15:30:00+0000", "schedule": "Every 1 hour" }
   }
 }
 ```
 
 `refresh_job.status` 狀態流程：`idle` → `processing` → `done` / `error`
+
+### `/api/v1/fantasy/sync` 回應範例
+
+```json
+{ "synced_at": "2026-04-08T15:00:00Z", "player_count": 312, "events": 3 }
+```
+
+`events` 為本次同步偵測到的持有異動筆數（pickup / drop / trade），寫入 `fantasy_events` 資料表。
 
 ### `/api/v1/leaderboard` 回應範例
 
@@ -205,6 +220,7 @@ join by player_id / mlbID（統一使用 MLBAM ID）
         ↓
 os.replace(real_data.json.tmp → real_data.json)  ← 原子寫入
 _cache.clear()
+_write_stat_snapshot()  ← SQLite append（非致命）
         ↓
 前端 Polling GET /api/v1/data/status 每 2 秒
 → refresh_job.status == "done" → fetchLeaderboard()
@@ -216,6 +232,7 @@ _cache.clear()
 - **原子寫入**：先寫 `.tmp` 再 `os.replace()`，讀取端永遠不會讀到半寫的 JSON
 - **並發保護**：第二次 POST refresh 時若仍在執行中，回傳 HTTP 409
 - **非致命 fetch**：Sources 3–6（Sprint Speed、投手三來源）各自包在 `try/except` 內；任一失敗只記錄 warning，不中斷整個 refresh
+- **非致命 DB 寫入**：SQLite 寫入失敗只記錄 warning，不影響排行榜功能
 - **無數據提示**：`real_data.json` 不存在時回傳 HTTP 404，提示用戶點擊「Refresh Stats」
 
 ## Yahoo Fantasy 整合
@@ -238,6 +255,18 @@ normalize_name() → 建立 _fantasy_index
 **`normalize_name()` 一致性**：後端與 `yahoo-fantasy-agent/player_list.py` 採同源邏輯（去重音、移除 Jr./Sr.、移除標點），確保 Fantasy JOIN 無縫接軌。此函式**僅**用於 Fantasy 擁有權對應；Statcast 兩個資料來源均使用 `player_id`（MLBAM ID）做精確 join，不需要名稱比對。
 
 ## 資料結構
+
+### `mlb_history.db`（SQLite）
+
+```sql
+-- 球員指標歷史：每次 refresh 全量寫入
+stat_snapshots(id, snapshot_at, player_id, metric_name, avg_value, sample_size, sample_type)
+
+-- Fantasy 持有異動：僅記錄有變化的事件
+fantasy_events(id, event_at, player_name, match_key, event_type, from_team, to_team)
+-- event_type: 'pickup'（FA→隊）| 'drop'（隊→FA）| 'trade'（隊→隊）
+-- from_team / to_team: NULL 代表 Free Agent
+```
 
 ### `real_data.json`
 
@@ -288,6 +317,7 @@ API 層：result[:limit]  ← 此處才套用 limit
 
 - **新增打者指標**：在 `backend/main.py` 的 `_METRIC_NAMES` 與對應 column dict，以及前端的 `METRIC_LABELS` + `FORMAT_CONFIG` 各加一行即可
 - **新增投手指標**：同上，另需確認是否加入 `_ASCENDING_METRICS`（低分=優）
-- **資料庫遷移**：將 `real_data.json` 的 `aggregates` 陣列對應至 SQLite 或 ClickHouse 資料表
+- **歷史趨勢 API**：基於現有 `stat_snapshots` 資料表，新增 `GET /api/v1/history/stats?player_id=&metric_name=` 端點回傳整季趨勢
+- **Fantasy 異動 API**：基於 `fantasy_events` 資料表，新增 `GET /api/v1/history/fantasy?player_name=` 回傳持有記錄
 - **分散式快取**：將 `_cache` dict 替換為 Redis，即可支援多 worker 部署
 - **投手 team 欄位**：目前純投手（不在 Sprint Speed 名單內）的 `team` 為空字串；可額外呼叫 Savant 球隊查詢端點補齊
