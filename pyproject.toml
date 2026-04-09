@@ -1,0 +1,18 @@
+[project]
+name = "mlb-leaderboards"
+version = "0.1.0"
+description = "Baseball Savant-style Leaderboards MVP"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-dotenv>=1.0.0",
+    "dotenv>=0.9.9",
+    "pandas>=3.0.2",
+    "yahoo-oauth>=2.1.1",
+    "yahoo-fantasy-api>=2.12.3",
+    "thefuzz>=0.22.1",
+    "pybaseball>=2.2.7",
+    "apscheduler>=3.10,<4",
+]
