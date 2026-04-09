@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import sys
 import time
 import unicodedata
@@ -34,6 +35,7 @@ _scheduler: AsyncIOScheduler | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler
+    _init_db()
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(
         _scheduled_fantasy_sync,
@@ -151,6 +153,39 @@ _data_source_meta: dict = {"source": "mock", "season": None, "fetched_at": None}
 _refresh_job: dict = {"status": "idle", "started_at": None, "error": None}
 
 REAL_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "real_data.json")
+DB_PATH        = os.path.join(os.path.dirname(__file__), "data", "mlb_history.db")
+
+
+def _init_db() -> None:
+    """Create SQLite tables if they don't exist. Safe to call on every startup."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS stat_snapshots (
+                id          INTEGER PRIMARY KEY,
+                snapshot_at TEXT NOT NULL,
+                player_id   TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                avg_value   REAL NOT NULL,
+                sample_size INTEGER,
+                sample_type TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_stat
+                ON stat_snapshots(player_id, metric_name, snapshot_at);
+
+            CREATE TABLE IF NOT EXISTS fantasy_events (
+                id          INTEGER PRIMARY KEY,
+                event_at    TEXT NOT NULL,
+                player_name TEXT NOT NULL,
+                match_key   TEXT NOT NULL,
+                event_type  TEXT NOT NULL,
+                from_team   TEXT,
+                to_team     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_fantasy
+                ON fantasy_events(match_key, event_at);
+        """)
+    logger.info("DB initialised: %s", DB_PATH)
 
 
 # Available metrics (used by /api/v1/metrics endpoint)
@@ -570,6 +605,25 @@ def _blocking_fetch(year: int) -> dict:
     }
 
 
+def _write_stat_snapshot(aggregates: list[dict], snapshot_at: str) -> None:
+    """Bulk-insert all metric records for this refresh into stat_snapshots. Non-fatal."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "INSERT INTO stat_snapshots "
+                "(snapshot_at, player_id, metric_name, avg_value, sample_size, sample_type) "
+                "VALUES (?,?,?,?,?,?)",
+                [
+                    (snapshot_at, r["player_id"], r["metric_name"],
+                     r["avg_value"], r["sample_size"], r["sample_type"])
+                    for r in aggregates
+                ],
+            )
+        logger.info("stat_snapshots: wrote %d records at %s", len(aggregates), snapshot_at)
+    except Exception as exc:
+        logger.warning("stat_snapshots write failed (non-fatal): %s", exc)
+
+
 async def _run_refresh(year: int) -> None:
     """Background task: fetch real data, write atomically, clear cache."""
     global _refresh_job
@@ -593,6 +647,7 @@ async def _run_refresh(year: int) -> None:
         _refresh_job["status"] = "done"
         logger.info("Real data refresh complete: %d players, %d records",
                     len(data["players"]), len(data["aggregates"]))
+        _write_stat_snapshot(data["aggregates"], data["fetched_at"])
     except Exception as exc:
         logger.exception("Real data refresh failed")
         _refresh_job = {
@@ -747,6 +802,51 @@ def data_status():
 # ---------------------------------------------------------------------------
 # Fantasy Roster Sync
 # ---------------------------------------------------------------------------
+def _detect_fantasy_events(
+    old_index: dict[str, str],
+    new_index: dict[str, str],
+    name_map:  dict[str, str],
+    event_at:  str,
+) -> list[tuple]:
+    """
+    Compare old vs new Fantasy index and return a list of change events.
+    Skips comparison if old_index is empty (first-ever sync).
+    event_type: 'pickup' (FA→team) | 'drop' (team→FA) | 'trade' (team→team)
+    """
+    if not old_index:
+        return []
+    events = []
+    for key in set(old_index) | set(new_index):
+        old_team = old_index.get(key)
+        new_team = new_index.get(key)
+        if old_team == new_team:
+            continue
+        name = name_map.get(key, key)
+        if old_team is None:
+            event_type = "pickup"
+        elif new_team is None:
+            event_type = "drop"
+        else:
+            event_type = "trade"
+        events.append((event_at, name, key, event_type, old_team, new_team))
+    return events
+
+
+def _write_fantasy_events(events: list[tuple]) -> None:
+    """Insert fantasy ownership change events into fantasy_events table. Non-fatal."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "INSERT INTO fantasy_events "
+                "(event_at, player_name, match_key, event_type, from_team, to_team) "
+                "VALUES (?,?,?,?,?,?)",
+                events,
+            )
+        logger.info("fantasy_events: wrote %d events", len(events))
+    except Exception as exc:
+        logger.warning("fantasy_events write failed (non-fatal): %s", exc)
+
+
 def _do_fantasy_sync() -> dict | str:
     """
     Core Fantasy sync logic. Returns a result dict on success, or an error
@@ -776,12 +876,17 @@ def _do_fantasy_sync() -> dict | str:
     except Exception as exc:
         return f"Yahoo API error: {exc}"
 
+    # Snapshot old index before overwriting (for event detection)
+    old_index = dict(_fantasy_index)
+
     # Build index using the same normalize_name function
     new_index: dict[str, str] = {}
     players_out: list[dict] = []
+    name_map: dict[str, str] = {}
     for p in roster_list:
         key = normalize_name(p["Player_Name"])
         new_index[key] = p["Team_Name"]
+        name_map[key] = p["Player_Name"]
         players_out.append({
             "match_key":    key,
             "fantasy_team": p["Team_Name"],
@@ -800,7 +905,12 @@ def _do_fantasy_sync() -> dict | str:
     _fantasy_synced_at = synced_at
     _cache.clear()
 
-    return {"synced_at": synced_at, "player_count": len(new_index)}
+    # Detect and persist ownership change events (non-fatal)
+    events = _detect_fantasy_events(old_index, new_index, name_map, synced_at)
+    if events:
+        _write_fantasy_events(events)
+
+    return {"synced_at": synced_at, "player_count": len(new_index), "events": len(events)}
 
 
 @app.post("/api/v1/fantasy/sync")
