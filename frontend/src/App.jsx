@@ -1,5 +1,10 @@
-import Leaderboard from './components/Leaderboard'
+import ErrorBoundary from './components/ErrorBoundary'
+import Leaderboard   from './components/Leaderboard'
 
 export default function App() {
-  return <Leaderboard />
+  return (
+    <ErrorBoundary>
+      <Leaderboard />
+    </ErrorBoundary>
+  )
 }
