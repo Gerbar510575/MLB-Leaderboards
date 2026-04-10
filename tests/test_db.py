@@ -139,7 +139,6 @@ class TestQueryHistoricalSnapshot:
 
     def test_uses_latest_snapshot_for_year(self, db):
         """Two snapshots in same year — should use the more recent one."""
-        import backend.db as db_mod
         # Write a newer snapshot with higher EV for all
         newer = [
             {"player_id": "111", "metric_name": "exit_velocity", "avg_value": 99.0, "sample_size": 110, "sample_type": "BBE"},
