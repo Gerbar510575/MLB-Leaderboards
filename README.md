@@ -1,11 +1,12 @@
 # MLB Leaderboards
 
-類似 [Baseball Savant Leaderboards](https://baseballsavant.mlb.com/leaderboard/statcast) 的全端 MVP 原型，以 FastAPI + React + Tailwind CSS 建構，整合 Yahoo Fantasy 球隊擁有權與真實 Statcast 數據。
+類似 [Baseball Savant Leaderboards](https://baseballsavant.mlb.com/leaderboard/statcast) 的全端應用，以 FastAPI + React + Tailwind CSS 建構，整合 Yahoo Fantasy 球隊擁有權與真實 Statcast 數據。
 
 ## 功能特色
 
 - **即時 Statcast 數據**：一鍵從 Baseball Savant 取得當季真實數據，自動排程每日更新
-- **歷史資料庫**：每次 refresh 自動寫入 SQLite，完整保存整季指標趨勢；Fantasy 持有異動（pickup / drop / trade）以 event 型態記錄
+- **多年度歷史排行榜**：Season 下拉選單可切換歷史年度；每次 refresh 自動寫入 SQLite，完整保存整季指標趨勢
+- **Fantasy 異動記錄**：Fantasy 持有異動（pickup / drop / trade）以 event 型態記錄
 - **打者指標排行榜**：Exit Velocity、xBA、xSLG、xwOBA、xwOBA-diff、Hard Hit Rate、Barrel Rate、Launch Angle、Sprint Speed（共 9 項）
 - **投手指標排行榜**：xERA、ERA−xERA、xwOBA Against、Hard Hit% Against、Barrel% Against、Avg EV Against、K/9、BB/9、K-BB%（共 9 項，低分優先指標自動反轉排序）
 - **最低樣本數篩選**：模擬 Savant 的「最低 BBE / PA / 跑壘機會」門檻，排除樣本不足的球員
@@ -21,7 +22,14 @@
 MLB_Leaderboards/
 ├── backend/
 │   ├── __init__.py
-│   ├── main.py              # FastAPI 應用程式（全部邏輯）
+│   ├── main.py          # FastAPI 應用程式（路由定義）
+│   ├── config.py        # pydantic-settings — 所有可設定值
+│   ├── cache.py         # TTL 快取
+│   ├── fetcher.py       # _blocking_fetch()、_compute_leaderboard()、6 個資料來源
+│   ├── adapters.py      # DataSourceAdapter Protocol + PybaseballAdapter
+│   ├── scheduler.py     # APScheduler 背景排程
+│   ├── db.py            # SQLite 讀寫（stat_snapshots / fantasy_events / players）
+│   ├── fantasy.py       # Yahoo Fantasy 同步與事件偵測
 │   └── data/
 │       ├── .gitkeep             # 確保目錄被 Git 追蹤
 │       ├── real_data.json        # pybaseball 抓取後產生（gitignore）
@@ -35,8 +43,22 @@ MLB_Leaderboards/
 │   └── src/
 │       ├── main.jsx
 │       ├── App.jsx
+│       ├── utils/
+│       │   └── format.js        # FORMAT_CONFIG、METRIC_LABELS、formatValue、getPercentileStyle
 │       └── components/
-│           └── Leaderboard.jsx
+│           ├── ErrorBoundary.jsx
+│           ├── Leaderboard.jsx      # 狀態管理 + 資料 fetch
+│           ├── FilterBar.jsx        # Metric / Season / Limit / MinReq + 按鈕
+│           ├── LeaderboardTable.jsx # 表格渲染
+│           ├── PercentileLegend.jsx # 色階說明
+│           └── SchedulerStatus.jsx  # 排程狀態列
+├── tests/
+│   ├── conftest.py
+│   ├── test_api.py
+│   ├── test_leaderboard.py
+│   ├── test_fetcher.py
+│   ├── test_db.py
+│   └── test_utils.py
 ├── .env                     # 環境變數（YAHOO 憑證，gitignore）
 ├── main.py                  # 便利啟動腳本
 └── pyproject.toml
@@ -53,7 +75,7 @@ MLB_Leaderboards/
 ### 後端
 
 ```bash
-# 安裝依賴（含 apscheduler）
+# 安裝依賴
 uv sync
 
 # 設定環境變數（Fantasy 同步需要）
@@ -72,6 +94,17 @@ uv run uvicorn backend.main:app --reload --port 8000
 #   首次使用：仍需手動點擊前端「Refresh Stats」取得初始數據
 ```
 
+可透過 `.env` 覆寫任何排程設定：
+
+```dotenv
+CACHE_TTL=300
+STATS_REFRESH_HOUR=10
+STATS_REFRESH_MINUTE=0
+STATS_REFRESH_MONTHS=3-10
+STATS_REFRESH_TZ=America/New_York
+FANTASY_SYNC_INTERVAL_HOURS=1
+```
+
 ### 前端
 
 ```bash
@@ -79,6 +112,12 @@ cd frontend
 npm install
 npm run dev
 # → http://localhost:5173
+```
+
+### 測試
+
+```bash
+uv run pytest tests/ -v   # 131 tests
 ```
 
 ## API 文件
@@ -89,8 +128,9 @@ npm run dev
 
 | Method | Path | 說明 |
 |--------|------|------|
-| `GET` | `/api/v1/leaderboard` | 排行榜資料（含 Fantasy 擁有權） |
+| `GET` | `/api/v1/leaderboard` | 排行榜資料（含 Fantasy 擁有權，支援歷史年度） |
 | `GET` | `/api/v1/metrics` | 所有可用指標 |
+| `GET` | `/api/v1/seasons` | SQLite 中有資料的歷史年度（降冪） |
 | `GET` | `/api/v1/cache/stats` | 快取狀態（debug） |
 | `DELETE` | `/api/v1/cache` | 手動清空快取 |
 | `POST` | `/api/v1/data/refresh` | 從 Baseball Savant 抓取真實 Statcast 數據（背景執行） |
@@ -105,6 +145,38 @@ npm run dev
 | `metric_name` | string | 必填 | 指標名稱，例如 `exit_velocity` |
 | `limit` | int | `500` | 回傳筆數（1–2000） |
 | `min_requirement` | int | `5` | 最低樣本數門檻（BBE 或 PA，視指標而定） |
+| `year` | int | 不填 | 歷史年度（2015–）；不填時回傳當季即時資料 |
+
+當 `year` 有值時，從 SQLite `stat_snapshots` 讀取最新快照；當 `year` 為空時，從 TTL 快取的 `real_data.json` 讀取。
+
+### `/api/v1/leaderboard` 回應範例
+
+```json
+{
+  "metric_name": "exit_velocity",
+  "limit": 500,
+  "min_requirement": 5,
+  "year": 2026,
+  "count": 423,
+  "data": [
+    {
+      "player_id": "592450",
+      "player_name": "Aaron Judge",
+      "team": "NYY",
+      "position": "RF",
+      "avg_value": 96.8,
+      "sample_size": 245,
+      "sample_type": "BBE",
+      "rank": 1,
+      "percentile": 100,
+      "fantasy_team": "Gerbar's Squad",
+      "is_owned": true
+    }
+  ]
+}
+```
+
+`sample_type` 說明：`"BBE"`（Batted Ball Events）用於 EV 類指標；`"PA"`（Plate Appearances）用於 xStats 與投手指標；`"sprints"` 用於 Sprint Speed。
 
 ### `/api/v1/data/status` 回應範例
 
@@ -134,34 +206,6 @@ npm run dev
 ```
 
 `events` 為本次同步偵測到的持有異動筆數（pickup / drop / trade），寫入 `fantasy_events` 資料表。
-
-### `/api/v1/leaderboard` 回應範例
-
-```json
-{
-  "metric_name": "exit_velocity",
-  "limit": 500,
-  "min_requirement": 5,
-  "count": 423,
-  "data": [
-    {
-      "player_id": "592450",
-      "player_name": "Aaron Judge",
-      "team": "NYY",
-      "position": "RF",
-      "avg_value": 96.8,
-      "sample_size": 245,
-      "sample_type": "BBE",
-      "rank": 1,
-      "percentile": 100,
-      "fantasy_team": "Gerbar's Squad",
-      "is_owned": true
-    }
-  ]
-}
-```
-
-`sample_type` 說明：`"BBE"`（Batted Ball Events）用於 EV 類指標；`"PA"`（Plate Appearances）用於 xStats 與投手指標；`"sprints"` 用於 Sprint Speed。
 
 ## 即時數據架構
 
@@ -221,6 +265,7 @@ join by player_id / mlbID（統一使用 MLBAM ID）
 os.replace(real_data.json.tmp → real_data.json)  ← 原子寫入
 _cache.clear()
 _write_stat_snapshot()  ← SQLite append（非致命）
+_upsert_players()       ← SQLite upsert 球員元資料（非致命）
         ↓
 前端 Polling GET /api/v1/data/status 每 2 秒
 → refresh_job.status == "done" → fetchLeaderboard()
@@ -266,6 +311,9 @@ stat_snapshots(id, snapshot_at, player_id, metric_name, avg_value, sample_size, 
 fantasy_events(id, event_at, player_name, match_key, event_type, from_team, to_team)
 -- event_type: 'pickup'（FA→隊）| 'drop'（隊→FA）| 'trade'（隊→隊）
 -- from_team / to_team: NULL 代表 Free Agent
+
+-- 球員元資料：每次 refresh upsert
+players(player_id, player_name, team, position, updated_at)
 ```
 
 ### `real_data.json`
@@ -315,8 +363,8 @@ API 層：result[:limit]  ← 此處才套用 limit
 
 ## 未來可擴充方向
 
-- **新增打者指標**：在 `backend/main.py` 的 `_METRIC_NAMES` 與對應 column dict，以及前端的 `METRIC_LABELS` + `FORMAT_CONFIG` 各加一行即可
-- **新增投手指標**：同上，另需確認是否加入 `_ASCENDING_METRICS`（低分=優）
+- **新增打者指標**：在 `backend/fetcher.py` 的 `_METRIC_NAMES` 與對應 column dict 各加一行，以及前端的 `METRIC_LABELS` + `FORMAT_CONFIG` 即可
+- **新增投手指標**：同上，另需確認是否加入 `_ASCENDING_METRICS`（低分=優）；同時更新 `db.py` 的 `_ASCENDING_METRICS` frozenset
 - **歷史趨勢 API**：基於現有 `stat_snapshots` 資料表，新增 `GET /api/v1/history/stats?player_id=&metric_name=` 端點回傳整季趨勢
 - **Fantasy 異動 API**：基於 `fantasy_events` 資料表，新增 `GET /api/v1/history/fantasy?player_name=` 回傳持有記錄
 - **分散式快取**：將 `_cache` dict 替換為 Redis，即可支援多 worker 部署
